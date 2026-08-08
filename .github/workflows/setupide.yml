@@ -1,0 +1,277 @@
+name: Mobile Cloud IDE
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ide:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup IDE Server & UI
+        run: |
+          mkdir -p ide_server
+          cd ide_server
+          npm init -y
+          npm install express cors body-parser
+
+          cat << 'EOF' > server.js
+          const express = require('express');
+          const cors = require('cors');
+          const bodyParser = require('body-parser');
+          const { exec } = require('child_process');
+          const fs = require('fs');
+          const path = require('path');
+
+          const app = express();
+          app.use(cors());
+          app.use(bodyParser.json({ limit: '50mb' }));
+          app.use(express.static('public'));
+
+          const WORKSPACE = path.join(__dirname, '..');
+
+          function getTree(dir, relative = '') {
+            let results = [];
+            const list = fs.readdirSync(dir);
+            list.forEach(file => {
+              if (file === 'ide_server' || file === '.git' || file === 'build') return;
+              const fullPath = path.join(dir, file);
+              const relPath = path.join(relative, file);
+              const stat = fs.statSync(fullPath);
+              if (stat && stat.isDirectory()) {
+                results.push({ name: file, path: relPath, type: 'dir', children: getTree(fullPath, relPath) });
+              } else {
+                results.push({ name: file, path: relPath, type: 'file' });
+              }
+            });
+            return results;
+          }
+
+          app.get('/api/tree', (req, res) => {
+            try { res.json(getTree(WORKSPACE)); } catch(e) { res.status(500).json({ error: e.message }); }
+          });
+
+          app.get('/api/file', (req, res) => {
+            const filePath = path.join(WORKSPACE, req.query.path);
+            try {
+              const content = fs.readFileSync(filePath, 'utf8');
+              res.json({ content });
+            } catch(e) { res.status(500).json({ error: e.message }); }
+          });
+
+          app.post('/api/file', (req, res) => {
+            const filePath = path.join(WORKSPACE, req.body.path);
+            try {
+              fs.mkdirSync(path.dirname(filePath), { recursive: true });
+              fs.writeFileSync(filePath, req.body.content, 'utf8');
+              res.json({ success: true });
+            } catch(e) { res.status(500).json({ error: e.message }); }
+          });
+
+          app.post('/api/create-project', (req, res) => {
+            const { name, org } = req.body;
+            exec(`flutter create --org ${org || 'com.example'} ${name} --overwrite && mv ${name}/* . 2>/dev/null || true && rm -rf ${name}`, { cwd: WORKSPACE }, (err, stdout, stderr) => {
+              if (err) return res.status(500).json({ error: stderr || err.message });
+              res.json({ success: true, log: stdout });
+            });
+          });
+
+          app.post('/api/build-apk', (req, res) => {
+            exec(`flutter pub get && flutter build apk --release`, { cwd: WORKSPACE, maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+              if (err) return res.status(500).json({ error: stderr || err.message, log: stdout });
+              res.json({ success: true, log: stdout });
+            });
+          });
+
+          app.get('/api/download-apk', (req, res) => {
+            const apkPath = path.join(WORKSPACE, 'build/app/outputs/flutter-apk/app-release.apk');
+            if (fs.existsSync(apkPath)) {
+              res.download(apkPath, 'app-release.apk');
+            } else {
+              res.status(404).send('APK not found. Build it first!');
+            }
+          });
+
+          app.listen(8080, () => console.log('IDE Server running on port 8080'));
+          EOF
+
+          mkdir -p public
+          cat << 'EOF' > public/index.html
+          <!DOCTYPE html>
+          <html class="dark">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+            <title>Mobile Flutter Cloud IDE</title>
+            <script src="https://cdn.tailwindcss.com"></script>
+          </head>
+          <body class="bg-gray-950 text-gray-100 h-screen flex flex-col overflow-hidden font-sans">
+            <!-- Header -->
+            <header class="bg-gray-900 border-b border-gray-800 p-3 flex justify-between items-center">
+              <div class="flex items-center space-x-2">
+                <button onclick="toggleTree()" class="bg-gray-800 px-3 py-1 rounded text-xs">📁 Files</button>
+                <span id="active-file" class="text-xs text-blue-400 font-mono truncate max-w-[150px]">No File Selected</span>
+              </div>
+              <button onclick="saveFile()" class="bg-green-600 font-bold px-3 py-1 rounded text-xs">💾 Save</button>
+            </header>
+
+            <!-- Actions Bar -->
+            <div class="bg-gray-900/50 border-b border-gray-800 p-2 flex space-x-2 overflow-x-auto text-xs">
+              <button onclick="createProjectPrompt()" class="bg-blue-600 px-3 py-1 rounded whitespace-nowrap">+ New Flutter App</button>
+              <button onclick="buildAPK()" class="bg-purple-600 px-3 py-1 rounded whitespace-nowrap">🚀 Build APK</button>
+              <a href="/api/download-apk" target="_blank" class="bg-amber-600 px-3 py-1 rounded whitespace-nowrap inline-block">📥 Download APK</a>
+            </div>
+
+            <!-- Workspace -->
+            <div class="flex-1 flex relative overflow-hidden">
+              <!-- Sidebar Drawer -->
+              <div id="drawer" class="absolute inset-y-0 left-0 w-64 bg-gray-900 border-r border-gray-800 transform -translate-x-full transition-transform duration-200 z-20 flex flex-col">
+                <div class="p-3 bg-gray-950 flex justify-between items-center border-b border-gray-800">
+                  <span class="font-bold text-xs">Files</span>
+                  <button onclick="toggleTree()" class="text-xs bg-red-800 px-2 py-0.5 rounded">✕</button>
+                </div>
+                <div id="tree" class="flex-1 overflow-y-auto p-2 font-mono text-xs">Loading tree...</div>
+              </div>
+
+              <!-- Code Editor -->
+              <textarea id="editor" class="w-full h-full p-3 bg-gray-950 text-green-400 font-mono text-sm resize-none focus:outline-none" placeholder="Select a file from the drawer to edit code..."></textarea>
+            </div>
+
+            <!-- Console Log -->
+            <div id="log-box" class="h-32 bg-black border-t border-gray-800 p-2 overflow-y-auto text-[10px] font-mono text-gray-400">
+              [System] Mobile Cloud IDE Server Running...
+            </div>
+
+            <script>
+              let currentPath = '';
+
+              function log(msg) {
+                const box = document.getElementById('log-box');
+                box.innerHTML += `<div>> ${msg}</div>`;
+                box.scrollTop = box.scrollHeight;
+              }
+
+              function toggleTree() {
+                document.getElementById('drawer').classList.toggle('-translate-x-full');
+              }
+
+              async function fetchTree() {
+                try {
+                  const res = await fetch('/api/tree');
+                  const tree = await res.json();
+                  document.getElementById('tree').innerHTML = renderTree(tree);
+                } catch(e) { log('Error fetching file tree'); }
+              }
+
+              function renderTree(nodes) {
+                let html = '';
+                nodes.forEach(node => {
+                  if (node.type === 'dir') {
+                    html += `<div class="ml-2 font-bold text-gray-400">📁 ${node.name}</div>${renderTree(node.children)}`;
+                  } else {
+                    html += `<div class="ml-4 text-gray-200 hover:text-blue-400 cursor-pointer my-1" onclick="openFile('${node.path}')">📄 ${node.name}</div>`;
+                  }
+                });
+                return html;
+              }
+
+              async function openFile(path) {
+                try {
+                  log(`Opening ${path}...`);
+                  const res = await fetch(`/api/file?path=${encodeURIComponent(path)}`);
+                  const data = await res.json();
+                  currentPath = path;
+                  document.getElementById('active-file').innerText = path;
+                  document.getElementById('editor').value = data.content;
+                  toggleTree();
+                  log(`Opened ${path}`);
+                } catch(e) { log('Failed to open file'); }
+              }
+
+              async function saveFile() {
+                if (!currentPath) return alert('No file open');
+                try {
+                  log(`Saving ${currentPath}...`);
+                  const content = document.getElementById('editor').value;
+                  await fetch('/api/file', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: currentPath, content })
+                  });
+                  log(`Saved ${currentPath}`);
+                  alert('File saved successfully!');
+                } catch(e) { log('Error saving file'); }
+              }
+
+              async function createProjectPrompt() {
+                const name = prompt('Project Name (e.g. calculator):');
+                const org = prompt('Package Prefix (e.g. com.example):');
+                if (!name) return;
+
+                log(`Creating Flutter project '${name}'... (takes ~30s)`);
+                try {
+                  const res = await fetch('/api/create-project', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, org })
+                  });
+                  const data = await res.json();
+                  if (data.success) {
+                    log('Flutter project created successfully!');
+                    fetchTree();
+                  } else {
+                    log(`Error: ${data.error}`);
+                  }
+                } catch(e) { log('Failed to generate project'); }
+              }
+
+              async function buildAPK() {
+                log('Building Release APK... (Takes ~2-3 mins)');
+                try {
+                  const res = await fetch('/api/build-apk', { method: 'POST' });
+                  const data = await res.json();
+                  if (data.success) {
+                    log('APK Build Successful! Click "Download APK" to get your file.');
+                    alert('APK Build Finished! Tap "Download APK" to install it.');
+                  } else {
+                    log(`Build Error: ${data.error}`);
+                  }
+                } catch(e) { log('Build failed or timed out'); }
+              }
+
+              fetchTree();
+            </script>
+          </body>
+          </html>
+          EOF
+
+      - name: Start Web Server & Tunnel
+        run: |
+          cd ide_server
+          node server.js &
+          sleep 3
+
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+
+          echo "================================================================"
+          echo "  🌐 YOUR MOBILE CLOUD IDE IS READY AT THE LINK BELOW 🌐"
+          echo "================================================================"
+          ./cloudflared tunnel --url http://localhost:8080
