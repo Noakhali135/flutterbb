@@ -36,22 +36,35 @@ jobs:
           const express = require('express');
           const cors = require('cors');
           const bodyParser = require('body-parser');
-          const { exec } = require('child_process');
+          const { spawn, exec } = require('child_process');
           const fs = require('fs');
           const path = require('path');
 
           const app = express();
           app.use(cors());
           app.use(bodyParser.json({ limit: '50mb' }));
-          app.use(express.static('public'));
 
           const WORKSPACE = path.join(__dirname, '..');
 
+          // Serve Static Web Preview
+          app.use('/preview', (req, res, next) => {
+            const webPath = path.join(WORKSPACE, 'build/web');
+            if (fs.existsSync(webPath)) {
+              express.static(webPath)(req, res, next);
+            } else {
+              res.status(404).send('Web Preview not built yet. Click "🌐 Live Web Preview" in the toolbar!');
+            }
+          });
+
+          app.use(express.static('public'));
+
+          // Recursive File Tree Builder
           function getTree(dir, relative = '') {
             let results = [];
+            if (!fs.existsSync(dir)) return results;
             const list = fs.readdirSync(dir);
             list.forEach(file => {
-              if (file === 'ide_server' || file === '.git' || file === 'build') return;
+              if (file === 'ide_server' || file === '.git' || file === 'build' || file === '.dart_tool') return;
               const fullPath = path.join(dir, file);
               const relPath = path.join(relative, file);
               const stat = fs.statSync(fullPath);
@@ -64,6 +77,7 @@ jobs:
             return results;
           }
 
+          // APIs
           app.get('/api/tree', (req, res) => {
             try { res.json(getTree(WORKSPACE)); } catch(e) { res.status(500).json({ error: e.message }); }
           });
@@ -85,6 +99,22 @@ jobs:
             } catch(e) { res.status(500).json({ error: e.message }); }
           });
 
+          app.post('/api/folder', (req, res) => {
+            const folderPath = path.join(WORKSPACE, req.body.path);
+            try {
+              fs.mkdirSync(folderPath, { recursive: true });
+              res.json({ success: true });
+            } catch(e) { res.status(500).json({ error: e.message }); }
+          });
+
+          app.post('/api/delete', (req, res) => {
+            const itemPath = path.join(WORKSPACE, req.body.path);
+            try {
+              fs.rmSync(itemPath, { recursive: true, force: true });
+              res.json({ success: true });
+            } catch(e) { res.status(500).json({ error: e.message }); }
+          });
+
           app.post('/api/create-project', (req, res) => {
             const { name, org } = req.body;
             exec(`flutter create --org ${org || 'com.example'} ${name} --overwrite && mv ${name}/* . 2>/dev/null || true && rm -rf ${name}`, { cwd: WORKSPACE }, (err, stdout, stderr) => {
@@ -93,11 +123,38 @@ jobs:
             });
           });
 
-          app.post('/api/build-apk', (req, res) => {
-            exec(`flutter pub get && flutter build apk --release`, { cwd: WORKSPACE, maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
-              if (err) return res.status(500).json({ error: stderr || err.message, log: stdout });
-              res.json({ success: true, log: stdout });
+          // SSE Stream Helper
+          function runCommandStream(cmd, args, res) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+
+            const child = spawn(cmd, args, { cwd: WORKSPACE, shell: true });
+
+            child.stdout.on('data', (data) => {
+              data.toString().split('\n').forEach(line => {
+                if (line.trim()) res.write(`data: ${JSON.stringify({ log: line })}\n\n`);
+              });
             });
+
+            child.stderr.on('data', (data) => {
+              data.toString().split('\n').forEach(line => {
+                if (line.trim()) res.write(`data: ${JSON.stringify({ log: '⚠️ ' + line })}\n\n`);
+              });
+            });
+
+            child.on('close', (code) => {
+              res.write(`data: ${JSON.stringify({ done: true, code })}\n\n`);
+              res.end();
+            });
+          }
+
+          app.get('/api/stream/build-apk', (req, res) => {
+            runCommandStream('flutter', ['pub', 'get', '&&', 'flutter', 'build', 'apk', '--release'], res);
+          });
+
+          app.get('/api/stream/build-web', (req, res) => {
+            runCommandStream('flutter', ['pub', 'get', '&&', 'flutter', 'build', 'web', '--release', '--base-href', '/preview/'], res);
           });
 
           app.get('/api/download-apk', (req, res) => {
@@ -121,31 +178,37 @@ jobs:
             <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
             <title>Mobile Flutter Cloud IDE</title>
             <script src="https://cdn.tailwindcss.com"></script>
+            <style>
+              summary::-webkit-details-marker { display: none; }
+            </style>
           </head>
           <body class="bg-gray-950 text-gray-100 h-screen flex flex-col overflow-hidden font-sans">
             <!-- Header -->
             <header class="bg-gray-900 border-b border-gray-800 p-3 flex justify-between items-center">
               <div class="flex items-center space-x-2">
-                <button onclick="toggleTree()" class="bg-gray-800 px-3 py-1 rounded text-xs">📁 Files</button>
-                <span id="active-file" class="text-xs text-blue-400 font-mono truncate max-w-[150px]">No File Selected</span>
+                <button onclick="toggleDrawer()" class="bg-gray-800 px-3 py-1 rounded text-xs font-bold">📁 Files</button>
+                <span id="active-file" class="text-xs text-blue-400 font-mono truncate max-w-[140px]">No File Selected</span>
               </div>
               <button onclick="saveFile()" class="bg-green-600 font-bold px-3 py-1 rounded text-xs">💾 Save</button>
             </header>
 
             <!-- Actions Bar -->
-            <div class="bg-gray-900/50 border-b border-gray-800 p-2 flex space-x-2 overflow-x-auto text-xs">
-              <button onclick="createProjectPrompt()" class="bg-blue-600 px-3 py-1 rounded whitespace-nowrap">+ New Flutter App</button>
-              <button onclick="buildAPK()" class="bg-purple-600 px-3 py-1 rounded whitespace-nowrap">🚀 Build APK</button>
+            <div class="bg-gray-900/60 border-b border-gray-800 p-2 flex space-x-2 overflow-x-auto text-xs">
+              <button onclick="createProjectPrompt()" class="bg-blue-600 px-3 py-1 rounded whitespace-nowrap">+ New App</button>
+              <button onclick="createFilePrompt('')" class="bg-gray-800 px-2 py-1 rounded whitespace-nowrap">+ File</button>
+              <button onclick="createFolderPrompt('')" class="bg-gray-800 px-2 py-1 rounded whitespace-nowrap">+ Folder</button>
+              <button onclick="startBuildStream('/api/stream/build-apk', 'APK')" class="bg-purple-600 px-3 py-1 rounded whitespace-nowrap">🚀 Build APK</button>
+              <button onclick="startBuildStream('/api/stream/build-web', 'Web')" class="bg-teal-600 px-3 py-1 rounded whitespace-nowrap">🌐 Live Web Preview</button>
               <a href="/api/download-apk" target="_blank" class="bg-amber-600 px-3 py-1 rounded whitespace-nowrap inline-block">📥 Download APK</a>
             </div>
 
             <!-- Workspace -->
             <div class="flex-1 flex relative overflow-hidden">
               <!-- Sidebar Drawer -->
-              <div id="drawer" class="absolute inset-y-0 left-0 w-64 bg-gray-900 border-r border-gray-800 transform -translate-x-full transition-transform duration-200 z-20 flex flex-col">
+              <div id="drawer" class="absolute inset-y-0 left-0 w-72 bg-gray-900 border-r border-gray-800 transform -translate-x-full transition-transform duration-200 z-20 flex flex-col">
                 <div class="p-3 bg-gray-950 flex justify-between items-center border-b border-gray-800">
-                  <span class="font-bold text-xs">Files</span>
-                  <button onclick="toggleTree()" class="text-xs bg-red-800 px-2 py-0.5 rounded">✕</button>
+                  <span class="font-bold text-xs">Project Explorer</span>
+                  <button onclick="toggleDrawer()" class="text-xs bg-red-800 px-2 py-0.5 rounded">✕</button>
                 </div>
                 <div id="tree" class="flex-1 overflow-y-auto p-2 font-mono text-xs">Loading tree...</div>
               </div>
@@ -154,23 +217,54 @@ jobs:
               <textarea id="editor" class="w-full h-full p-3 bg-gray-950 text-green-400 font-mono text-sm resize-none focus:outline-none" placeholder="Select a file from the drawer to edit code..."></textarea>
             </div>
 
-            <!-- Console Log -->
-            <div id="log-box" class="h-32 bg-black border-t border-gray-800 p-2 overflow-y-auto text-[10px] font-mono text-gray-400">
-              [System] Mobile Cloud IDE Server Running...
+            <!-- Real-Time Console Output -->
+            <div class="h-40 bg-black border-t border-gray-800 flex flex-col">
+              <div class="bg-gray-900 px-3 py-1 text-[10px] font-mono text-gray-400 flex justify-between items-center border-b border-gray-800">
+                <span id="build-status">Console Output</span>
+                <span id="build-timer" class="text-yellow-400">00:00</span>
+              </div>
+              <div id="log-box" class="flex-1 p-2 overflow-y-auto text-[10px] font-mono text-gray-300 space-y-0.5">
+                <div>> Mobile Cloud IDE Server Ready...</div>
+              </div>
+            </div>
+
+            <!-- Web Preview Modal -->
+            <div id="preview-modal" class="hidden fixed inset-0 bg-black/90 z-30 flex flex-col">
+              <div class="bg-gray-900 p-2 flex justify-between items-center border-b border-gray-800">
+                <span class="text-xs font-bold text-teal-400">🌐 Flutter Live Web Preview</span>
+                <button onclick="closePreviewModal()" class="px-3 py-1 bg-red-700 text-xs rounded">Close Preview</button>
+              </div>
+              <iframe id="preview-frame" class="flex-1 w-full h-full bg-white border-none"></iframe>
             </div>
 
             <script>
               let currentPath = '';
+              let timerInterval = null;
+              let secondsElapsed = 0;
 
               function log(msg) {
                 const box = document.getElementById('log-box');
-                box.innerHTML += `<div>> ${msg}</div>`;
+                const div = document.createElement('div');
+                div.innerText = msg;
+                box.appendChild(div);
                 box.scrollTop = box.scrollHeight;
               }
 
-              function toggleTree() {
-                document.getElementById('drawer').classList.toggle('-translate-x-full');
+              function startTimer() {
+                secondsElapsed = 0;
+                clearInterval(timerInterval);
+                timerInterval = setInterval(() => {
+                  secondsElapsed++;
+                  const mins = String(Math.floor(secondsElapsed / 60)).padStart(2, '0');
+                  const secs = String(secondsElapsed % 60).padStart(2, '0');
+                  document.getElementById('build-timer').innerText = `${mins}:${secs}`;
+                }, 1000);
               }
+
+              function stopTimer() { clearInterval(timerInterval); }
+
+              function toggleDrawer() { document.getElementById('drawer').classList.toggle('-translate-x-full'); }
+              function closePreviewModal() { document.getElementById('preview-modal').classList.add('hidden'); }
 
               async function fetchTree() {
                 try {
@@ -184,9 +278,24 @@ jobs:
                 let html = '';
                 nodes.forEach(node => {
                   if (node.type === 'dir') {
-                    html += `<div class="ml-2 font-bold text-gray-400">📁 ${node.name}</div>${renderTree(node.children)}`;
+                    html += `
+                      <details class="ml-2 my-1" open>
+                        <summary class="cursor-pointer text-yellow-400 font-bold hover:text-yellow-300 flex justify-between items-center py-0.5">
+                          <span>📁 ${node.name}</span>
+                          <span class="space-x-1 opacity-70">
+                            <button onclick="event.preventDefault(); createFilePrompt('${node.path}')" class="text-[9px] bg-gray-800 px-1 rounded text-white">+f</button>
+                            <button onclick="event.preventDefault(); createFolderPrompt('${node.path}')" class="text-[9px] bg-gray-800 px-1 rounded text-white">+d</button>
+                            <button onclick="event.preventDefault(); deleteItem('${node.path}')" class="text-[9px] bg-red-900 px-1 rounded text-white">✕</button>
+                          </span>
+                        </summary>
+                        <div class="border-l border-gray-800 ml-2 pl-1">${renderTree(node.children)}</div>
+                      </details>`;
                   } else {
-                    html += `<div class="ml-4 text-gray-200 hover:text-blue-400 cursor-pointer my-1" onclick="openFile('${node.path}')">📄 ${node.name}</div>`;
+                    html += `
+                      <div class="ml-4 my-1 flex justify-between items-center group">
+                        <span class="text-gray-300 hover:text-blue-400 cursor-pointer truncate" onclick="openFile('${node.path}')">📄 ${node.name}</span>
+                        <button onclick="deleteItem('${node.path}')" class="text-[9px] bg-red-900 px-1 rounded text-white opacity-60 hover:opacity-100">✕</button>
+                      </div>`;
                   }
                 });
                 return html;
@@ -200,9 +309,9 @@ jobs:
                   currentPath = path;
                   document.getElementById('active-file').innerText = path;
                   document.getElementById('editor').value = data.content;
-                  toggleTree();
-                  log(`Opened ${path}`);
-                } catch(e) { log('Failed to open file'); }
+                  toggleDrawer();
+                  log(`Loaded ${path}`);
+                } catch(e) { log('Failed to load file'); }
               }
 
               async function saveFile() {
@@ -216,8 +325,42 @@ jobs:
                     body: JSON.stringify({ path: currentPath, content })
                   });
                   log(`Saved ${currentPath}`);
-                  alert('File saved successfully!');
+                  alert('File saved!');
                 } catch(e) { log('Error saving file'); }
+              }
+
+              async function createFilePrompt(parentPath = '') {
+                const name = prompt('File Name (e.g. lib/models/user.dart):');
+                if (!name) return;
+                const fullPath = parentPath ? `${parentPath}/${name}` : name;
+                await fetch('/api/file', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ path: fullPath, content: '// New File' })
+                });
+                fetchTree();
+              }
+
+              async function createFolderPrompt(parentPath = '') {
+                const name = prompt('Folder Name:');
+                if (!name) return;
+                const fullPath = parentPath ? `${parentPath}/${name}` : name;
+                await fetch('/api/folder', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ path: fullPath })
+                });
+                fetchTree();
+              }
+
+              async function deleteItem(path) {
+                if (!confirm(`Delete ${path}?`)) return;
+                await fetch('/api/delete', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ path })
+                });
+                fetchTree();
               }
 
               async function createProjectPrompt() {
@@ -225,7 +368,7 @@ jobs:
                 const org = prompt('Package Prefix (e.g. com.example):');
                 if (!name) return;
 
-                log(`Creating Flutter project '${name}'... (takes ~30s)`);
+                log(`Creating Flutter project '${name}'...`);
                 try {
                   const res = await fetch('/api/create-project', {
                     method: 'POST',
@@ -242,18 +385,43 @@ jobs:
                 } catch(e) { log('Failed to generate project'); }
               }
 
-              async function buildAPK() {
-                log('Building Release APK... (Takes ~2-3 mins)');
-                try {
-                  const res = await fetch('/api/build-apk', { method: 'POST' });
-                  const data = await res.json();
-                  if (data.success) {
-                    log('APK Build Successful! Click "Download APK" to get your file.');
-                    alert('APK Build Finished! Tap "Download APK" to install it.');
-                  } else {
-                    log(`Build Error: ${data.error}`);
+              function startBuildStream(endpoint, type) {
+                document.getElementById('build-status').innerText = `Building ${type}...`;
+                log(`========== STARTING ${type} BUILD ==========`);
+                startTimer();
+
+                const evtSource = new EventSource(endpoint);
+
+                evtSource.onmessage = (e) => {
+                  const data = JSON.parse(e.data);
+                  if (data.log) log(data.log);
+
+                  if (data.done) {
+                    evtSource.close();
+                    stopTimer();
+                    if (data.code === 0) {
+                      document.getElementById('build-status').innerText = `${type} Finished!`;
+                      log(`========== ${type} BUILD SUCCESSFUL ==========`);
+                      
+                      if (type === 'Web') {
+                        document.getElementById('preview-frame').src = '/preview/?t=' + Date.now();
+                        document.getElementById('preview-modal').classList.remove('hidden');
+                      } else if (type === 'APK') {
+                        alert('APK Build Finished! Tap "Download APK" to install it.');
+                      }
+                    } else {
+                      document.getElementById('build-status').innerText = `${type} Failed`;
+                      log(`========== ${type} BUILD FAILED (Code ${data.code}) ==========`);
+                    }
                   }
-                } catch(e) { log('Build failed or timed out'); }
+                };
+
+                evtSource.onerror = () => {
+                  evtSource.close();
+                  stopTimer();
+                  document.getElementById('build-status').innerText = 'Build Error';
+                  log('Stream error / build interrupted');
+                };
               }
 
               fetchTree();
