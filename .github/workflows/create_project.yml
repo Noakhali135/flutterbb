@@ -1,0 +1,45 @@
+name: Create Flutter Project
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_name:
+        description: 'Project Name'
+        required: true
+        default: 'my_flutter_app'
+      package_name:
+        description: 'Package Name (e.g. com.example.app)'
+        required: true
+        default: 'com.example.app'
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+
+      - name: Create Flutter App
+        run: |
+          flutter create --org ${{ github.event.inputs.package_name }} ${{ github.event.inputs.project_name }} --overwrite
+          mv ${{ github.event.inputs.project_name }}/* . 2>/dev/null || true
+          mv ${{ github.event.inputs.project_name }}/.* . 2>/dev/null || true
+          rm -rf ${{ github.event.inputs.project_name }}
+
+      - name: Commit and Push
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add .
+          git commit -m "Generated Flutter project: ${{ github.event.inputs.project_name }}" || exit 0
+          git push
